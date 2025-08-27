@@ -536,8 +536,8 @@
       <input type="text" placeholder="搜索代币/钱包" onkeyup="searchTokens(this.value)" />
       <input id="trackAddressInput" type="text" placeholder="输入合约地址添加监控" style="margin-left:10px; min-width:240px;" onkeydown="if(event.key==='Enter'){trackAddressFromTopBar()}" />
       <button class="refresh-btn" style="margin-left:6px;" onclick="trackAddressFromTopBar()">添加</button>
-      <!-- 隐藏修复按钮：如需使用可暂时去掉 display:none -->
-      <button id="fix-meta-btn" class="refresh-btn" style="margin-left:6px; display:none;" onclick="backfillMissingMeta()">修复名称</button>
+      <!-- 修复按钮：已隐藏（代币名称已正常显示） -->
+      <button id="fix-meta-btn" class="refresh-btn" style="margin-left:6px; display:none;" onclick="forceRefreshTokenNames()">修复名称</button>
     </div>
     <div id="wallet-section">
       <button class="connect-wallet" onclick="connectWallet()">连接钱包</button>
@@ -761,7 +761,9 @@
     // ERC20 元数据 ABI（用于兜底读取 name/symbol）
     const ERC20_METADATA_ABI = [
       'function name() view returns (string)',
-      'function symbol() view returns (string)'
+      'function symbol() view returns (string)',
+      'function totalSupply() view returns (uint256)',
+      'function decimals() view returns (uint8)'
     ];
 
                    // 全局变量
@@ -890,10 +892,14 @@
              // 启动价格监控
              startPriceMonitoring();
             
-            // 启动后自动尝试回填缺失元数据（延迟执行，避免阻塞）
-            setTimeout(() => {
-              try { backfillMissingMeta(); } catch (e) { console.warn('自动回填元数据失败:', e); }
-            }, 3000);
+                         // 启动后自动尝试回填缺失元数据（延迟执行，避免阻塞）
+             setTimeout(() => {
+               try { 
+                 backfillMissingMeta(); 
+                 // 同步代币名称数据
+                 syncTokenNames();
+               } catch (e) { console.warn('自动回填元数据失败:', e); }
+             }, 3000);
            } catch (error) {
              console.error('初始化失败:', error);
            }
@@ -1063,13 +1069,42 @@
           lastStatusUpdate: Date.now()
         };
 
-        // 兜底提取 name/symbol（仅 DYOR）
-        const metaGuess = extractNameSymbolFromDescription(description);
-        if (metaGuess.name && !tokenInfo.name) tokenInfo.name = metaGuess.name;
-        if (metaGuess.symbol && !tokenInfo.symbol) tokenInfo.symbol = metaGuess.symbol;
+        // 优先尝试从合约读取真实的名称和符号
+        try {
+          const erc20Contract = new ethers.Contract(address, ERC20_METADATA_ABI, readProvider);
+          const [name, symbol] = await Promise.all([
+            erc20Contract.name().catch(() => ''),
+            erc20Contract.symbol().catch(() => '')
+          ]);
+          
+          if (name && typeof name === 'string' && name.trim()) {
+            tokenInfo.name = name.trim();
+          }
+          if (symbol && typeof symbol === 'string' && symbol.trim()) {
+            tokenInfo.symbol = symbol.trim();
+          }
+        } catch (e) {
+          console.warn('无法从合约读取名称/符号:', e);
+        }
+        
+        // 如果合约中没有名称，才尝试从描述中提取（兜底）
+        if (!tokenInfo.name || !tokenInfo.symbol) {
+          const metaGuess = extractNameSymbolFromDescription(description);
+          if (metaGuess.name && !tokenInfo.name) tokenInfo.name = metaGuess.name;
+          if (metaGuess.symbol && !tokenInfo.symbol) tokenInfo.symbol = metaGuess.symbol;
+        }
 
+        // 确保两个数据源都包含完整的代币信息
         tokenData[address] = tokenInfo;
         deployedTokens.push(tokenInfo);
+        
+        // 强制同步名称和符号到两个数据源
+        if (tokenInfo.name) {
+          tokenData[address].name = tokenInfo.name;
+        }
+        if (tokenInfo.symbol) {
+          tokenData[address].symbol = tokenInfo.symbol;
+        }
 
         // 异步解析 DYOR 代币头像（仅对 DYOR 生效）
         (async () => {
@@ -1116,6 +1151,9 @@
          function updateTokenDisplay() {
       // 按时间排序
       deployedTokens.sort((a, b) => b.timestamp - a.timestamp);
+      
+      // 同步代币名称数据
+      syncTokenNames();
       
       // 渲染前尝试补全缺失头像与名称/符号（仅 DYOR）
       try {
@@ -1215,8 +1253,8 @@
            <div class="info">
              <div class="title">
                <span class="status-indicator ${statusClass}"></span>
-               ${token.name || token.symbol || token.description || 'Unknown Token'}
-               ${token.symbol ? `<span style=\"margin-left:6px;color:#aaa;font-weight:normal;font-size:12px;\">(${token.symbol})</span>` : ''}
+               ${token.name || token.symbol || (token.description && !token.description.startsWith('http') ? token.description : 'Unknown Token')}
+               ${token.symbol && token.symbol !== token.name ? `<span style=\"margin-left:6px;color:#aaa;font-weight:normal;font-size:12px;\">(${token.symbol})</span>` : ''}
                <span class="launchpad-badge ${launchpadClass}">${launchpadBadge}</span>
              </div>
              <div class="desc">
@@ -1224,7 +1262,9 @@
                创建时间: ${new Date(token.timestamp).toLocaleString()}<br/>
                ${token.amount ? `初始金额: ${token.amount} OKB<br/>` : ''}
                ${token.status === 'opened' ? `价格: ${token.price ? token.price.toFixed(6) + ' OKB' : '获取中...'}<br/>` : ''}
-               ${token.status === 'opened' ? `流动性: ${token.liquidity ? token.liquidity.toFixed(2) + ' OKB' : '获取中...'}` : ''}
+               ${token.status === 'opened' ? `池子OKB: ${token.liquidity ? token.liquidity.toFixed(2) + ' OKB' : '获取中...'}<br/>` : ''}
+               ${token.status === 'opened' ? `市值: ${token.marketCap ? formatMarketCap(token.marketCap) : '获取中...'}` : ''}
+               ${token.status === 'pending' ? `即将开盘: 流动性 ${token.liquidity ? token.liquidity.toFixed(2) + ' OKB' : '获取中...'}<br/>` : ''}
                ${token.status === 'opened' && launchpadClass === 'dyor-launchpad' && token.priceChange !== undefined ? 
                  `<span class="price-change ${token.priceChange >= 0 ? 'positive' : 'negative'}">
                    ${token.priceChange >= 0 ? '+' : ''}${token.priceChange.toFixed(2)}%
@@ -1334,27 +1374,31 @@
 
     // 显示代币详情
     function showTokenDetails(address) {
-      const token = tokenData[address];
+      // 优先从 deployedTokens 中查找，确保数据一致性
+      let token = deployedTokens.find(t => t.address === address);
+      if (!token) {
+        token = tokenData[address];
+      }
       if (!token) return;
 
       const modal = document.getElementById('tokenModal');
       const modalTitle = document.getElementById('modalTitle');
       const modalDetails = document.getElementById('modalDetails');
 
-      modalTitle.textContent = token.description || '代币详情';
+      modalTitle.textContent = token.name || token.symbol || (token.description && !token.description.startsWith('http') ? token.description : '代币详情');
       modalDetails.innerHTML = `
         <div class="detail-item">
           <h4>基本信息</h4>
           <p><strong>名称:</strong> ${token.name || '—'}</p>
           <p><strong>符号:</strong> ${token.symbol || '—'}</p>
-          <p><strong>简介:</strong> ${token.description || '—'}</p>
+          <p><strong>简介:</strong> ${token.description && !token.description.startsWith('http') ? token.description : '—'}</p>
           <p><strong>地址:</strong> ${token.address}</p>
           <p><strong>创建时间:</strong> ${new Date(token.timestamp).toLocaleString()}</p>
           <p><strong>初始金额:</strong> ${token.amount} OKB</p>
         </div>
         <div class="detail-item">
           <h4>链接</h4>
-          <p><strong>网站:</strong> ${token.website ? `<a href="${token.website}" target="_blank">${token.website}</a>` : '无'}</p>
+          <p><strong>网站:</strong> ${token.website && !token.website.startsWith('http') ? token.website : (token.website ? `<a href="${token.website}" target="_blank">${token.website}</a>` : '无')}</p>
           <p><strong>Telegram:</strong> ${token.telegram ? `<a href="${token.telegram}" target="_blank">${token.telegram}</a>` : '无'}</p>
           <p><strong>Twitter:</strong> ${token.twitter ? `<a href="${token.twitter}" target="_blank">${token.twitter}</a>` : '无'}</p>
         </div>
@@ -1362,7 +1406,22 @@
            <h4>操作</h4>
            <button class="buy-btn" onclick="showBuyInterface('${token.address}')">买入代币</button>
            <button class="refresh-btn" onclick="addToMonitoring('${token.address}')">添加到监控</button>
+           ${token.status === 'opened' || token.status === 'pending' ? `<button class="refresh-btn" onclick="showPoolDetails('${token.address}')" style="margin-top: 5px; background: #00d8ff;">查看池子详情</button>` : ''}
          </div>
+        <div class="detail-item">
+          <h4>市场数据</h4>
+          ${token.status === 'opened' ? `
+            <p><strong>价格:</strong> ${token.price ? token.price.toFixed(6) + ' OKB' : '获取中...'}</p>
+            <p><strong>池子OKB:</strong> ${token.liquidity ? token.liquidity.toFixed(2) + ' OKB' : '获取中...'}</p>
+            <p><strong>市值:</strong> ${token.marketCap ? formatMarketCap(token.marketCap) : '获取中...'}</p>
+            <p><strong>总供应量:</strong> ${token.totalSupply ? token.totalSupply.toLocaleString() : '获取中...'}</p>
+          ` : token.status === 'pending' ? `
+            <p><strong>即将开盘:</strong> <span style="color: #ffaa00;">流动性接近开盘条件</span></p>
+            <p><strong>当前流动性:</strong> ${token.liquidity ? token.liquidity.toFixed(2) + ' OKB' : '获取中...'}</p>
+            <p><strong>开盘条件:</strong> ${OPENING_DETECTION_CONFIG.OPENING_CONDITIONS.MIN_LIQUIDITY_OKB} OKB</p>
+            <p style="color: #ffaa00;">⚠️ 代币即将开盘，请密切关注</p>
+          ` : '<p>代币尚未开盘，暂无市场数据</p>'}
+        </div>
         <div class="detail-item">
           <h4>状态</h4>
           <p><strong>当前状态:</strong> <span class="status-indicator ${getStatusClass(token.status)}"></span>${getStatusText(token.status)}</p>
@@ -2031,22 +2090,53 @@
             }
           }
         } catch (_) {
-          // 不属于标准 Pair，则尝试 Pumpu 虚拟/真实储备
-          try {
-            const pump = new ethers.Contract(address, PUMP_TOKEN_EXT_ABI, readProvider);
-            const [vEth, vTok] = await Promise.all([
-              pump.virtualEth().catch(() => ethers.constants.Zero),
-              pump.virtualToken().catch(() => ethers.constants.Zero)
-            ]);
-            liquidityOkb = Number(ethers.utils.formatEther(vEth));
-            if (vTok && vTok.gt(0)) {
-              priceOkb = Number(ethers.utils.formatEther(vEth)) / Number(ethers.utils.formatEther(vTok));
-            }
-          } catch (__) {}
+                     // 不属于标准 Pair，则尝试 Pumpu 虚拟/真实储备
+           try {
+             const pump = new ethers.Contract(address, PUMP_TOKEN_EXT_ABI, readProvider);
+             const [vEth, vTok, rEth, rTok] = await Promise.all([
+               pump.virtualEth().catch(() => ethers.constants.Zero),
+               pump.virtualToken().catch(() => ethers.constants.Zero),
+               pump.realEth().catch(() => ethers.constants.Zero),
+               pump.realToken().catch(() => ethers.constants.Zero)
+             ]);
+             
+             // 虚拟储备 + 真实储备 = 总储备
+             const totalEth = vEth.add(rEth);
+             liquidityOkb = Number(ethers.utils.formatEther(totalEth));
+             
+             if (vTok.gt(0) || rTok.gt(0)) {
+               const totalTok = vTok.add(rTok);
+               priceOkb = Number(ethers.utils.formatEther(totalEth)) / Number(ethers.utils.formatEther(totalTok));
+             }
+           } catch (__) {}
         }
 
         tokenData[address].liquidity = liquidityOkb;
         tokenData[address].price = priceOkb;
+        
+        // 获取代币总供应量和计算市值
+        try {
+          const tokenContract = new ethers.Contract(address, ERC20_METADATA_ABI, readProvider);
+          const [supply, decimals] = await Promise.all([
+            tokenContract.totalSupply(),
+            tokenContract.decimals()
+          ]);
+          
+          const totalSupply = parseFloat(ethers.utils.formatUnits(supply, decimals));
+          tokenData[address].totalSupply = totalSupply;
+          
+          // 计算市值：总供应量 × 价格
+          if (priceOkb > 0 && totalSupply > 0) {
+            tokenData[address].marketCap = totalSupply * priceOkb;
+          } else {
+            tokenData[address].marketCap = 0;
+          }
+        } catch (capError) {
+          console.warn('无法获取市值信息:', capError);
+          tokenData[address].totalSupply = 0;
+          tokenData[address].marketCap = 0;
+        }
+        
         // 无 indexer 情况下，holderCount 与 tradeVolume 暂置 0
         tokenData[address].holderCount = 0;
         tokenData[address].tradeVolume = 0;
@@ -2066,10 +2156,47 @@
     async function checkPendingConditions(address) {
       try {
         const token = tokenData[address];
-        const timeSinceDeploy = Date.now() - token.timestamp;
         
-        // 如果部署时间超过30分钟，标记为即将打满
-        return timeSinceDeploy > 1800000; // 30分钟
+        // 检查流动性是否接近开盘条件（比如达到80%以上）
+        const conditions = OPENING_DETECTION_CONFIG.OPENING_CONDITIONS;
+        const minLiquidity = conditions.MIN_LIQUIDITY_OKB;
+        
+        // 获取当前流动性
+        let currentLiquidity = 0;
+        try {
+          // 优先尝试按 UniswapV2 Pair 读取储备
+          const pair = new ethers.Contract(address, PAIR_ABI, readProvider);
+          const [reserve0, reserve1] = await pair.getReserves();
+          const [t0, t1] = await Promise.all([
+            pair.token0(),
+            pair.token1()
+          ]);
+          const wokbLower = CONFIG.WOKB.toLowerCase();
+          if (t0.toLowerCase() === wokbLower) {
+            currentLiquidity = Number(ethers.utils.formatEther(reserve0));
+          } else if (t1.toLowerCase() === wokbLower) {
+            currentLiquidity = Number(ethers.utils.formatEther(reserve1));
+          }
+        } catch (_) {
+          // 尝试 Pumpu 虚拟储备
+          try {
+            const pump = new ethers.Contract(address, PUMP_TOKEN_EXT_ABI, readProvider);
+            const [vEth, vTok, rEth, rTok] = await Promise.all([
+              pump.virtualEth().catch(() => ethers.constants.Zero),
+              pump.virtualToken().catch(() => ethers.constants.Zero),
+              pump.realEth().catch(() => ethers.constants.Zero),
+              pump.realToken().catch(() => ethers.constants.Zero)
+            ]);
+            
+            const totalEth = vEth.add(rEth);
+            currentLiquidity = Number(ethers.utils.formatEther(totalEth));
+          } catch (__) {}
+        }
+        
+        // 如果流动性达到开盘条件的80%以上，标记为即将打满
+        const liquidityThreshold = minLiquidity * 0.8; // 80%的开盘条件
+        return currentLiquidity >= liquidityThreshold && currentLiquidity < minLiquidity;
+        
       } catch (error) {
         console.error(`检查即将打满条件失败 ${address}:`, error);
         return false;
@@ -2093,19 +2220,30 @@
           } else if (t1.toLowerCase() === wokbLower && reserve0.gt(0)) {
             priceOkb = Number(ethers.utils.formatEther(reserve1)) / Number(ethers.utils.formatEther(reserve0));
           }
-        } catch (_) {
-          try {
-            const pump = new ethers.Contract(address, PUMP_TOKEN_EXT_ABI, readProvider);
-            const [vEth, vTok] = await Promise.all([
-              pump.virtualEth().catch(() => ethers.constants.Zero),
-              pump.virtualToken().catch(() => ethers.constants.Zero)
-            ]);
-            if (vTok && vTok.gt(0)) {
-              priceOkb = Number(ethers.utils.formatEther(vEth)) / Number(ethers.utils.formatEther(vTok));
-            }
-          } catch (__) {}
-        }
+                 } catch (_) {
+           try {
+             const pump = new ethers.Contract(address, PUMP_TOKEN_EXT_ABI, readProvider);
+             const [vEth, vTok, rEth, rTok] = await Promise.all([
+               pump.virtualEth().catch(() => ethers.constants.Zero),
+               pump.virtualToken().catch(() => ethers.constants.Zero),
+               pump.realEth().catch(() => ethers.constants.Zero),
+               pump.realToken().catch(() => ethers.constants.Zero)
+             ]);
+             
+             if (vTok.gt(0) || rTok.gt(0)) {
+               const totalEth = vEth.add(rEth);
+               const totalTok = vTok.add(rTok);
+               priceOkb = Number(ethers.utils.formatEther(totalEth)) / Number(ethers.utils.formatEther(totalTok));
+             }
+           } catch (__) {}
+         }
         token.price = priceOkb;
+        
+        // 更新市值
+        if (token.totalSupply && token.totalSupply > 0 && priceOkb > 0) {
+          token.marketCap = token.totalSupply * priceOkb;
+        }
+        
         updateTokenPriceDisplay(address);
       } catch (error) {
         console.error(`更新代币价格失败 ${address}:`, error);
@@ -2114,7 +2252,7 @@
 
     // 更新代币价格显示
     function updateTokenPriceDisplay(address) {
-      // 简化：重新渲染卡片区域
+      // 简化：重新渲染卡片区域aa
       updateTokenDisplay();
     }
 
@@ -2815,28 +2953,67 @@
              const tokenAmount = amounts[1];
              const price = parseFloat(ethers.utils.formatUnits(tokenAmount, 18));
              
-             // 计算流动性（通过getReserves获取）
+             // 计算流动性（通过Pair合约获取）
              let liquidity = 0;
              try {
-               // 尝试获取流动性池信息
-               const reserves = await routerContract.getReserves();
-               const token0 = await routerContract.token0();
+               // 尝试获取流动性池信息 - 代币地址就是池子地址
+               const pairContract = new ethers.Contract(tokenAddress, PAIR_ABI, readProvider);
+               const [reserve0, reserve1] = await pairContract.getReserves();
+               const [token0, token1] = await Promise.all([
+                 pairContract.token0(),
+                 pairContract.token1()
+               ]);
                
                if (token0.toLowerCase() === wokbAddress.toLowerCase()) {
                  // WOKB是token0
-                 liquidity = parseFloat(ethers.utils.formatEther(reserves.reserve0));
-               } else {
+                 liquidity = parseFloat(ethers.utils.formatEther(reserve0));
+               } else if (token1.toLowerCase() === wokbAddress.toLowerCase()) {
                  // WOKB是token1
-                 liquidity = parseFloat(ethers.utils.formatEther(reserves.reserve1));
+                 liquidity = parseFloat(ethers.utils.formatEther(reserve1));
                }
              } catch (liquidityError) {
                console.warn('无法获取流动性信息:', liquidityError);
-               liquidity = 0;
+               // 尝试作为Pumpu代币读取
+               try {
+                 const pumpContract = new ethers.Contract(tokenAddress, PUMP_TOKEN_EXT_ABI, readProvider);
+                 const [vEth, rEth] = await Promise.all([
+                   pumpContract.virtualEth().catch(() => ethers.constants.Zero),
+                   pumpContract.realEth().catch(() => ethers.constants.Zero)
+                 ]);
+                 liquidity = parseFloat(ethers.utils.formatEther(vEth.add(rEth)));
+               } catch (pumpError) {
+                 console.warn('无法获取Pumpu流动性信息:', pumpError);
+                 liquidity = 0;
+               }
+             }
+             
+             // 获取代币总供应量和精度，计算市值
+             let totalSupply = 0;
+             let marketCap = 0;
+             try {
+               const tokenContract = new ethers.Contract(tokenAddress, ERC20_METADATA_ABI, readProvider);
+               const [supply, decimals] = await Promise.all([
+                 tokenContract.totalSupply(),
+                 tokenContract.decimals()
+               ]);
+               
+               totalSupply = parseFloat(ethers.utils.formatUnits(supply, decimals));
+               
+               // 计算市值：总供应量 × 价格
+               if (price > 0 && totalSupply > 0) {
+                 marketCap = totalSupply * price;
+               }
+             } catch (capError) {
+               console.warn('无法获取市值信息:', capError);
+               totalSupply = 0;
+               marketCap = 0;
              }
              
              return {
                price: price,
                liquidity: liquidity,
+               totalSupply: totalSupply,
+               marketCap: marketCap,
                timestamp: Date.now()
              };
            } catch (priceError) {
@@ -2844,6 +3021,8 @@
              return {
                price: 0,
                liquidity: 0,
+               totalSupply: 0,
+               marketCap: 0,
                timestamp: Date.now()
              };
            }
@@ -2852,6 +3031,8 @@
            return {
              price: 0,
              liquidity: 0,
+             totalSupply: 0,
+             marketCap: 0,
              timestamp: Date.now()
            };
          }
@@ -2877,6 +3058,8 @@
              if (priceData.price > 0) {
                token.price = priceData.price;
                token.liquidity = priceData.liquidity;
+               token.totalSupply = priceData.totalSupply;
+               token.marketCap = priceData.marketCap;
                token.lastPriceUpdate = priceData.timestamp;
                
                // 计算价格变化百分比
@@ -2941,6 +3124,8 @@
                  if (priceData.price > 0) {
                    token.price = priceData.price;
                    token.liquidity = priceData.liquidity;
+                   token.totalSupply = priceData.totalSupply;
+                   token.marketCap = priceData.marketCap;
                    token.lastPriceUpdate = priceData.timestamp;
                    
                    // 计算价格变化百分比
@@ -3066,13 +3251,14 @@
          const statsClass = launchpadType === 'okay' ? 'okay' : '';
          const title = launchpadType === 'okay' ? 'OKAY发射台统计' : 'DYOR发射台统计';
          
-         // 为DYOR发射台添加价格和流动性统计
+         // 为DYOR发射台添加价格、流动性和市值统计
          let additionalStats = '';
          if (launchpadType !== 'okay') {
            const tokensWithPrice = tokens.filter(t => t.status === 'opened' && t.price && t.price > 0);
            const avgPrice = tokensWithPrice.length > 0 ? 
              (tokensWithPrice.reduce((sum, t) => sum + t.price, 0) / tokensWithPrice.length).toFixed(6) : '0';
            const totalLiquidity = tokensWithPrice.reduce((sum, t) => sum + (t.liquidity || 0), 0).toFixed(2);
+           const totalMarketCap = tokensWithPrice.reduce((sum, t) => sum + (t.marketCap || 0), 0);
            
            additionalStats = `
              <div class="stat-item">
@@ -3081,7 +3267,11 @@
              </div>
              <div class="stat-item">
                <div class="stat-value">${totalLiquidity}</div>
-               <div class="stat-label">总流动性(OKB)</div>
+               <div class="stat-label">总池子OKB</div>
+             </div>
+             <div class="stat-item">
+               <div class="stat-value">${formatMarketCap(totalMarketCap)}</div>
+               <div class="stat-label">总市值</div>
              </div>
            `;
          }
@@ -3259,19 +3449,21 @@
            const avgPrice = prices.reduce((sum, p) => sum + p, 0) / prices.length;
            
            const totalLiquidity = tokensWithPrice.reduce((sum, t) => sum + (t.liquidity || 0), 0);
+           const totalMarketCap = tokensWithPrice.reduce((sum, t) => sum + (t.marketCap || 0), 0);
            
            // 计算价格变化统计
            const tokensWithChange = tokensWithPrice.filter(t => t.priceChange !== undefined);
            const positiveChanges = tokensWithChange.filter(t => t.priceChange > 0);
            const negativeChanges = tokensWithChange.filter(t => t.priceChange < 0);
            
-           summaryElement.textContent = `${tokensWithPrice.length}个代币 | 平均价格: ${avgPrice.toFixed(6)} OKB`;
+           summaryElement.textContent = `${tokensWithPrice.length}个代币 | 平均价格: ${avgPrice.toFixed(6)} OKB | 总市值: ${formatMarketCap(totalMarketCap)}`;
            
            detailsElement.innerHTML = `
              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 5px;">
                <div>最低价格: <span style="color: #00ff00;">${minPrice.toFixed(6)} OKB</span></div>
                <div>最高价格: <span style="color: #ff4444;">${maxPrice.toFixed(6)} OKB</span></div>
-               <div>总流动性: <span style="color: #00d8ff;">${totalLiquidity.toFixed(2)} OKB</span></div>
+               <div>总池子OKB: <span style="color: #00d8ff;">${totalLiquidity.toFixed(2)} OKB</span></div>
+               <div>总市值: <span style="color: #ff00ff;">${formatMarketCap(totalMarketCap)}</span></div>
                <div>上涨代币: <span style="color: #00ff00;">${positiveChanges.length}个</span></div>
                <div>下跌代币: <span style="color: #ff4444;">${negativeChanges.length}个</span></div>
                <div>稳定代币: <span style="color: #aaa;">${tokensWithChange.length - positiveChanges.length - negativeChanges.length}个</span></div>
@@ -3369,6 +3561,276 @@
            const panel = document.querySelector('.settings-panel');
            if (panel) {
              panel.remove();
+           }
+         }
+         
+         // 强制刷新所有代币的名称和符号
+         async function forceRefreshTokenNames() {
+           try {
+             showNotification('🔄 正在强制刷新代币名称...', 'info');
+             
+             const targets = deployedTokens.filter(t => t && t.address);
+             let updated = 0;
+             
+             for (const token of targets) {
+               try {
+                 // 强制从合约重新读取名称和符号
+                 const erc20Contract = new ethers.Contract(token.address, ERC20_METADATA_ABI, readProvider);
+                 const [name, symbol] = await Promise.all([
+                   erc20Contract.name().catch(() => ''),
+                   erc20Contract.symbol().catch(() => '')
+                 ]);
+                 
+                 let changed = false;
+                 if (name && typeof name === 'string' && name.trim() && name !== token.name) {
+                   token.name = name.trim();
+                   changed = true;
+                 }
+                 if (symbol && typeof symbol === 'string' && symbol.trim() && symbol !== token.symbol) {
+                   token.symbol = symbol.trim();
+                   changed = true;
+                 }
+                 
+                 if (changed) {
+                   updated++;
+                   console.log(`✅ 更新代币 ${token.address}: name="${token.name}", symbol="${token.symbol}"`);
+                   
+                   // 同步更新 tokenData 中的对应数据
+                   if (tokenData[token.address]) {
+                     tokenData[token.address].name = token.name;
+                     tokenData[token.address].symbol = token.symbol;
+                   }
+                 }
+                 
+                 // 添加小延迟避免请求过快
+                 await new Promise(resolve => setTimeout(resolve, 100));
+               } catch (e) {
+                 console.warn(`刷新代币 ${token.address} 名称失败:`, e);
+               }
+             }
+             
+             // 同步数据源
+             syncTokenNames();
+             
+             // 更新显示
+             updateTokenDisplay();
+             
+             // 保存到 Firebase
+             try {
+               await saveToFirebase({
+                 tokens: deployedTokens,
+                 tokenData: tokenData,
+                 lastUpdated: Date.now()
+               }, 'pumpu_tokens');
+               console.log('✅ 名称更新已保存到 Firebase');
+             } catch (e) {
+               console.warn('保存名称更新到 Firebase 失败:', e);
+             }
+             
+             showNotification(`✅ 名称刷新完成：${updated}/${targets.length} 个代币已更新`, 'success');
+           } catch (error) {
+             console.error('强制刷新代币名称失败:', error);
+             showNotification('❌ 名称刷新失败：' + error.message, 'error');
+           }
+         }
+         
+         // 获取池子详细信息（OKB数量、代币数量、价格等）
+         async function getPoolDetails(tokenAddress) {
+           try {
+             if (!readProvider) {
+               throw new Error('只读Provider未初始化');
+             }
+             
+             // 尝试作为 UniswapV2 Pair 读取
+             try {
+               const pair = new ethers.Contract(tokenAddress, PAIR_ABI, readProvider);
+               const [reserve0, reserve1] = await pair.getReserves();
+               const [token0, token1] = await Promise.all([
+                 pair.token0(),
+                 pair.token1()
+               ]);
+               
+               const wokbLower = CONFIG.WOKB.toLowerCase();
+               let okbReserve = 0;
+               let tokenReserve = 0;
+               let price = 0;
+               
+               if (token0.toLowerCase() === wokbLower) {
+                 okbReserve = Number(ethers.utils.formatEther(reserve0));
+                 tokenReserve = Number(ethers.utils.formatEther(reserve1));
+               } else if (token1.toLowerCase() === wokbLower) {
+                 okbReserve = Number(ethers.utils.formatEther(reserve1));
+                 tokenReserve = Number(ethers.utils.formatEther(reserve0));
+               }
+               
+               if (tokenReserve > 0) {
+                 price = okbReserve / tokenReserve;
+               }
+               
+               return {
+                 okbAmount: okbReserve,
+                 tokenAmount: tokenReserve,
+                 price: price,
+                 type: 'uniswap_v2_pair'
+               };
+             } catch (e) {
+                                // 尝试作为 Pumpu 代币读取
+                 try {
+                   const pump = new ethers.Contract(tokenAddress, PUMP_TOKEN_EXT_ABI, readProvider);
+                   const [vEth, vTok] = await Promise.all([
+                     pump.virtualEth().catch(() => ethers.constants.Zero),
+                     pump.virtualToken().catch(() => ethers.constants.Zero)
+                   ]);
+                   
+                   const okbReserve = Number(ethers.utils.formatEther(vEth));
+                   const tokenReserve = Number(ethers.utils.formatEther(vTok));
+                   let price = 0;
+                   
+                   if (tokenReserve > 0) {
+                     price = okbReserve / tokenReserve;
+                   }
+                   
+                   return {
+                     okbAmount: okbReserve,
+                     tokenAmount: tokenReserve,
+                     price: price,
+                     type: 'pumpu_token'
+                   };
+                 } catch (e2) {
+                   throw new Error('无法识别池子类型');
+                 }
+             }
+           } catch (error) {
+             console.error('获取池子详情失败:', error);
+             return {
+               okbAmount: 0,
+               tokenAmount: 0,
+               price: 0,
+               type: 'unknown'
+             };
+           }
+         }
+         
+
+         
+         // 同步 deployedTokens 和 tokenData 中的名称数据
+         function syncTokenNames() {
+           try {
+             deployedTokens.forEach(token => {
+               if (tokenData[token.address]) {
+                 // 如果 deployedTokens 中有名称但 tokenData 中没有，同步过去
+                 if (token.name && !tokenData[token.address].name) {
+                   tokenData[token.address].name = token.name;
+                 }
+                 if (token.symbol && !tokenData[token.address].symbol) {
+                   tokenData[token.address].symbol = token.symbol;
+                 }
+                 
+                 // 如果 tokenData 中有名称但 deployedTokens 中没有，同步过来
+                 if (tokenData[token.address].name && !token.name) {
+                   token.name = tokenData[token.address].name;
+                 }
+                 if (tokenData[token.address].symbol && !token.symbol) {
+                   token.symbol = tokenData[token.address].symbol;
+                 }
+               }
+             });
+             
+             console.log('✅ 代币名称数据同步完成');
+           } catch (error) {
+             console.error('代币名称数据同步失败:', error);
+           }
+         }
+         
+         // 格式化市值显示
+         function formatMarketCap(marketCap) {
+           if (marketCap >= 1000000) {
+             return (marketCap / 1000000).toFixed(2) + 'M OKB';
+           } else if (marketCap >= 1000) {
+             return (marketCap / 1000).toFixed(2) + 'K OKB';
+           } else {
+             return marketCap.toFixed(2) + ' OKB';
+           }
+         }
+         
+
+         
+         // 显示池子详细信息
+         async function showPoolDetails(tokenAddress) {
+           try {
+             showNotification('🔄 正在获取池子详情...', 'info');
+             
+             const poolInfo = await getPoolDetails(tokenAddress);
+             const token = deployedTokens.find(t => t.address === tokenAddress) || tokenData[tokenAddress];
+             
+             if (!poolInfo || poolInfo.okbAmount === 0) {
+               showNotification('❌ 无法获取池子信息', 'error');
+               return;
+             }
+             
+             // 创建池子详情弹窗
+             const modal = document.createElement('div');
+             modal.style.cssText = `
+               position: fixed;
+               top: 0;
+               left: 0;
+               width: 100%;
+               height: 100%;
+               background: rgba(0, 0, 0, 0.8);
+               z-index: 10003;
+               display: flex;
+               align-items: center;
+               justify-content: center;
+               animation: fadeIn 0.3s ease;
+             `;
+             
+             modal.innerHTML = `
+               <div style="background: #1e1e1e; padding: 30px; border-radius: 12px; border: 1px solid #2c2c2c; max-width: 500px; width: 90%;">
+                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                   <h3 style="color: #00d8ff; margin: 0;">🏊 池子详情</h3>
+                   <button onclick="this.parentElement.parentElement.parentElement.remove()" style="background: none; border: none; color: #aaa; font-size: 24px; cursor: pointer;">&times;</button>
+                 </div>
+                 
+                 <div style="background: #2c2c2c; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                   <h4 style="color: #00ff00; margin-bottom: 15px;">${token?.name || token?.symbol || '代币'} 池子信息</h4>
+                   
+                   <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                     <div style="text-align: center; padding: 15px; background: #1e1e1e; border-radius: 6px;">
+                       <div style="font-size: 24px; font-weight: bold; color: #00ff00;">${poolInfo.okbAmount.toFixed(2)}</div>
+                       <div style="font-size: 12px; color: #aaa;">池子OKB数量</div>
+                     </div>
+                     
+                     <div style="text-align: center; padding: 15px; background: #1e1e1e; border-radius: 6px;">
+                       <div style="font-size: 24px; font-weight: bold; color: #00d8ff;">${poolInfo.tokenAmount.toLocaleString()}</div>
+                       <div style="font-size: 12px; color: #aaa;">池子代币数量</div>
+                     </div>
+                   </div>
+                   
+                   <div style="margin-top: 15px; padding: 15px; background: #1e1e1e; border-radius: 6px; text-align: center;">
+                     <div style="font-size: 18px; font-weight: bold; color: #ff00ff;">${poolInfo.price.toFixed(8)} OKB</div>
+                     <div style="font-size: 12px; color: #aaa;">当前价格</div>
+                   </div>
+                   
+                   <div style="margin-top: 10px; text-align: center;">
+                     <span style="background: #333; color: #00d8ff; padding: 4px 8px; border-radius: 4px; font-size: 11px;">
+                       池子类型: ${poolInfo.type === 'uniswap_v2_pair' ? 'Uniswap V2' : poolInfo.type === 'pumpu_token' ? 'Pumpu' : '未知'}
+                     </span>
+
+                   </div>
+                 </div>
+                 
+                 <div style="text-align: center;">
+                   <button onclick="this.parentElement.parentElement.parentElement.remove()" style="background: #00d8ff; color: #000; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold;">关闭</button>
+                 </div>
+               </div>
+             `;
+             
+             document.body.appendChild(modal);
+             showNotification('✅ 池子详情已显示', 'success');
+             
+           } catch (error) {
+             console.error('显示池子详情失败:', error);
+             showNotification('❌ 显示池子详情失败: ' + error.message, 'error');
            }
          }
          
@@ -3572,17 +4034,33 @@
     function extractNameSymbolFromDescription(desc) {
       try {
         if (!desc || typeof desc !== 'string') return { name: '', symbol: '' };
+        
+        // 如果描述是纯URL，不提取名称
+        if (desc.match(/^https?:\/\/\S+$/)) {
+          return { name: '', symbol: '' };
+        }
+        
         let text = desc.replace(/https?:\/\/\S+/g, ' ').replace(/[\u{1F300}-\u{1FAFF}\u{1F600}-\u{1F64F}]/gu, ' ').trim();
         text = text.replace(/[^A-Za-z0-9 _\-]/g, ' ').replace(/\s+/g, ' ').trim();
-        if (!text) return { name: '', symbol: '' };
+        
+        if (!text || text.length < 2) return { name: '', symbol: '' };
+        
         // 常见格式: NAME SYMBOL, NAME - SYMBOL, NAME(SYMBOL)
         const paren = text.match(/^([^()]{2,})\(([^()]{1,12})\)/);
         if (paren) return { name: paren[1].trim().slice(0, 24), symbol: paren[2].trim().slice(0, 12) };
+        
         const dash = text.match(/^(.{2,})\s[-|–|—]\s([A-Za-z0-9]{1,12})/);
         if (dash) return { name: dash[1].trim().slice(0, 24), symbol: dash[2].trim().slice(0, 12) };
+        
         const parts = text.split(' ');
         const symbolGuess = (parts.find(p => /^[A-Z0-9]{2,12}$/.test(p)) || '').slice(0, 12);
         const nameGuess = text.slice(0, 24).trim();
+        
+        // 如果提取的名称太短或看起来不像真实名称，返回空
+        if (nameGuess.length < 2 || /^[0-9\s]+$/.test(nameGuess)) {
+          return { name: '', symbol: '' };
+        }
+        
         return { name: nameGuess, symbol: symbolGuess };
       } catch { return { name: '', symbol: '' }; }
     }
